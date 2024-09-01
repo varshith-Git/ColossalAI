@@ -1,7 +1,5 @@
 import enum
-import logging
 import os
-import warnings
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
@@ -33,8 +31,10 @@ from colossalai.checkpoint_io.utils import (
 )
 from colossalai.interface import AMPModelMixin, ModelWrapper, OptimizerWrapper
 from colossalai.interface.optimizer import DistributedOptim
+from colossalai.logging import get_dist_logger
 from colossalai.nn.optimizer import DistGaloreAwamW, cast_to_distributed
 from colossalai.quantization import BnbQuantizationConfig, quantize_model
+from colossalai.quantization.fp8_hook import FP8Hook
 from colossalai.tensor.colo_parameter import ColoParameter
 from colossalai.tensor.param_op_hook import ColoParamOpHookManager
 from colossalai.zero import LowLevelZeroOptimizer
@@ -63,7 +63,12 @@ class OptimizerParamCheckState(enum.Enum):
 
 class LowLevelZeroModel(ModelWrapper, AMPModelMixin):
     def __init__(
-        self, module: nn.Module, precision: str, overlap_allgather: bool = False, cast_inputs: bool = True
+        self,
+        module: nn.Module,
+        precision: str,
+        overlap_allgather: bool = False,
+        cast_inputs: bool = True,
+        use_fp8: bool = False,
     ) -> None:
         super().__init__(module)
         self.dtype = None
@@ -76,11 +81,16 @@ class LowLevelZeroModel(ModelWrapper, AMPModelMixin):
         module = module.to(get_accelerator().get_current_device())
         self.module = module
         self.convert_fn = None
+        self.use_fp8 = use_fp8
         if self.dtype is not None and cast_inputs:
             self.convert_fn = partial(_convert_floating_point, dtype=self.dtype)
         self.overlap_allgather = overlap_allgather
+        self.op_hooks = []
         if overlap_allgather:
-            self.op_hook = ZeroOpHook()
+            self.op_hooks.append(ZeroOpHook())
+        if use_fp8:
+            self.op_hooks.append(FP8Hook())
+        if overlap_allgather or use_fp8:
             for p in module.parameters():
                 if p.requires_grad and type(p) is not ColoParameter:
                     p.__class__ = ColoParameter
@@ -90,7 +100,7 @@ class LowLevelZeroModel(ModelWrapper, AMPModelMixin):
         if self.convert_fn is not None:
             args = tree_map(self.convert_fn, args)
             kwargs = tree_map(self.convert_fn, kwargs)
-        ctx = ColoParamOpHookManager.use_hooks(self.op_hook) if self.overlap_allgather else nullcontext()
+        ctx = ColoParamOpHookManager.use_hooks(*self.op_hooks) if self.overlap_allgather else nullcontext()
         with ctx:
             return super().forward(*args, **kwargs)
 
@@ -140,7 +150,7 @@ class LowLevelZeroCheckpointIO(TorchDDPCheckpointIO):
         """
         assert isinstance(optimizer, LowLevelZeroOptimizer), "Please boost the optimizer before saving!"
         if os.path.isfile(checkpoint):
-            logging.error(f"Provided path ({checkpoint}) should be a directory, not a file")
+            self.logger.error(f"Provided path ({checkpoint}) should be a directory, not a file", ranks=[0])
             return
 
         Path(checkpoint).mkdir(parents=True, exist_ok=True)
@@ -177,10 +187,11 @@ class LowLevelZeroCheckpointIO(TorchDDPCheckpointIO):
         index_file.append_meta_data("total_size", total_size)
         if self.coordinator.is_master():
             index_file.write_index_file(save_index_file)
-        logging.info(
+        self.logger.info(
             f"The optimizer is going to be split to checkpoint shards. "
             f"You can find where each parameters has been saved in the "
-            f"index located at {save_index_file}."
+            f"index located at {save_index_file}.",
+            ranks=[0],
         )
 
     def load_sharded_optimizer(self, optimizer: OptimizerWrapper, index_file_path: str, prefix: str):
@@ -267,7 +278,7 @@ class LowLevelZeroCheckpointIO(TorchDDPCheckpointIO):
 
     def save_lora_as_pretrained(self, model, checkpoint, use_safetensors):
         if os.path.isfile(checkpoint):
-            logging.error(f"Provided path ({checkpoint}) should be a directory, not a file")
+            self.logger.error(f"Provided path ({checkpoint}) should be a directory, not a file", ranks=[0])
             return
         from peft import PeftModel
 
@@ -337,6 +348,8 @@ class LowLevelZeroPlugin(DPPluginBase):
         master_weights: bool = True,
         verbose: bool = False,
         cast_inputs: bool = True,
+        fp8_communication: bool = False,
+        use_fp8: bool = False,
     ) -> None:
         super().__init__()
         assert stage in (1, 2), f"LowLevelZeroPlugin only supports stage 1/2 training"
@@ -360,11 +373,14 @@ class LowLevelZeroPlugin(DPPluginBase):
             cpu_offload=cpu_offload,
             master_weights=master_weights,
             overlap_allgather=overlap_allgather,
+            fp8_communication=fp8_communication,
         )
         self.lora_enabled = False
         self.verbose = verbose
+        self.logger = get_dist_logger()
         self.cast_inputs = cast_inputs
 
+        self.use_fp8 = use_fp8
         # set class name with stage, for better error message
         setattr(self.__class__, "__name__", f"LowLevelZeroPlugin_ZeRO-{stage}")
 
@@ -400,7 +416,7 @@ class LowLevelZeroPlugin(DPPluginBase):
 
         assert not isinstance(model, LowLevelZeroModel), "Lora should be enabled before boosting the model."
         self.lora_enabled = True
-        warnings.warn("You have enabled LoRa training. Please check the hyperparameters such as lr")
+        self.logger.warning("You have enabled LoRa training. Please check the hyperparameters such as lr", ranks=[0])
 
         if bnb_quantization_config is not None:
             model = quantize_model(model, bnb_quantization_config)
@@ -449,8 +465,9 @@ class LowLevelZeroPlugin(DPPluginBase):
                 origin_param = name2param[origin_key]
                 group_id, check_state = self.get_param_group_id(optimizer, origin_param, param)
                 if check_state == OptimizerParamCheckState.ORIGIN_PARAM_NOT_FIND:
-                    warnings.warn(
-                        f"Origin parameter {origin_key} related to {name} doesn't exist in optimizer param_groups."
+                    self.logger.warning(
+                        f"Origin parameter {origin_key} related to {name} doesn't exist in optimizer param_groups.",
+                        ranks=[0],
                     )
                 elif (
                     check_state == OptimizerParamCheckState.ORIGIN_PARAM_FINDED
@@ -482,6 +499,7 @@ class LowLevelZeroPlugin(DPPluginBase):
                 self.precision,
                 overlap_allgather=self.zero_optim_kwargs["overlap_allgather"],
                 cast_inputs=self.cast_inputs,
+                use_fp8=self.use_fp8,
             )
 
         # TODO: Support Galore + ZeRO
@@ -493,7 +511,10 @@ class LowLevelZeroPlugin(DPPluginBase):
         optimizer = cast_to_distributed(optimizer)
 
         if isinstance(optimizer, DistGaloreAwamW) and zero_stage > 0 and dp_size > 0:
-            warnings.warn("Galore is only supported for Tensor Parallel and vanilla Data Parallel yet. Disabling ZeRO.")
+            self.logger.warning(
+                "Galore is only supported for Tensor Parallel and vanilla Data Parallel yet. Disabling ZeRO.",
+                ranks=[0],
+            )
             zero_optim_kwargs["partition_grad"] = False
             zero_stage = 0
 
